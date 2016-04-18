@@ -157,6 +157,13 @@ TH_API void THNN_(LookupTable_accGradParameters)(
           int paddingValue,
           real scale);
 
+TH_API void THNN_(LookupTable_renorm)(
+          THNNState *state,            // library's state
+          THIndexTensor *idx,          // vector that contains row indices (modified in function)
+          THTensor *weight,            // 2D tensor whose rows will be renormalized
+          real maxNorm,                // maximum norm
+          real normType);              // the norm type (e.g., normType=2, then it's 2-norm)
+
 TH_API void THNN_(MarginCriterion_updateOutput)(
           THNNState *state,            // library's state
           THTensor *input,             // input tensor
@@ -528,9 +535,13 @@ TH_API void THNN_(BatchNormalization_backward)(
           THTensor *gradWeight,
           THTensor *gradBias,
           THTensor *weight,
+          THTensor *running_mean,
+          THTensor *running_var,
           THTensor *save_mean,
           THTensor *save_std,
-          double scale);
+          bool train,
+          double scale,
+          double eps);
 
 TH_API void THNN_(SpatialConvolutionMap_updateOutput)(
           THNNState *state,       // library state

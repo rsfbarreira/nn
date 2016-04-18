@@ -1306,6 +1306,24 @@ function nntest.MarginRankingCriterion()
 
 end
 
+function nntest.MaskedSelect()
+   local input = torch.randn(4, 5)
+   local mask = torch.ByteTensor(4, 5):bernoulli()
+   local module = nn.MaskedSelect()
+   local out = module:forward({input, mask})
+   local err = out:dist(input:maskedSelect(mask))
+   mytester:assertlt(err, 1e-15, torch.typename(module) .. ' - forward err ')
+
+   local gradOut = torch.Tensor({20, 80})
+   input = torch.Tensor({{10, 20}, {30, 40}})
+   local inTarget = torch.Tensor({{20, 0}, {0, 80}})
+   local mask = torch.ByteTensor({{1, 0}, {0, 1}})
+   local module = nn.MaskedSelect()
+   module:forward({input, mask})
+   local gradIn = module:backward({input, mask}, gradOut)
+   mytester:assertTensorEq(inTarget, gradIn[1], 1e-15, torch.typename(module) .. ' - backward err ')
+end
+
 function nntest.ParallelCriterion()
    local input = {torch.rand(2,10), torch.randn(2,10)}
    local target = {torch.IntTensor{1,8}, torch.randn(2,10)}
@@ -4209,6 +4227,43 @@ function nntest.LookupTable()
    end
    local err = padw_sum - padw:sum()
    mytester:assertlt(err,precision, 'padding update error ')
+   -- test whether the weights changes accordingly when maxNorm is not nil
+   local all_index = torch.randperm(totalIndex):int()
+   -- input can have duplicates
+   local input = torch.repeatTensor(all_index:narrow(1,1,nIndex), 2)
+   local maxNorm = math.random()
+   for _, normType in ipairs{1, 2, math.random()} do
+      local module = nn.LookupTable(totalIndex, entry_size, 0, maxNorm, normType)
+      local oriW = module.weight:clone()
+      output = module:updateOutput(input)
+      -- check output is of small norm
+      for j = 1,output:size(1) do
+         local norm = torch.norm(output:select(1, j), normType)
+         if norm > maxNorm then
+            local err = norm - maxNorm;
+            mytester:assertlt(math.abs(err), precision, string.format(
+               'output after renorm exceeds maxNorm=[%f] with normType=[%f]', maxNorm, normType))
+         end
+      end
+      -- check the update of the module.weight
+      for j = 1,totalIndex do
+         local k = all_index[j]
+         if j <= nIndex then -- k is an index in "input"
+            local norm = torch.norm(module.weight:select(1, k), normType)
+            local oriNorm = torch.norm(oriW:select(1, k), normType)
+            if oriNorm > maxNorm then
+               local err = norm - maxNorm
+               mytester:assertlt(math.abs(err), precision, 'unexpected norm after renorm')
+            else
+               local err = norm - oriNorm
+               mytester:assertlt(math.abs(err), precision, 'unpexpected norm after renorm')
+            end
+         else -- k is not an index in "input"
+            local err = module.weight:select(1,k):sum() - oriW:select(1,k):sum()
+            mytester:assertlt(math.abs(err), precision, 'unexpected changes in weight after renorm')
+         end
+      end
+   end
 end
 
 function nntest.AddConstant()
@@ -4437,6 +4492,7 @@ function nntest.SelectTable()
       torch.rand(3,4,5),
       {torch.rand(3,4,5), torch.rand(3,4,5)}
    }
+   
    module = nn.SelectTable(1)
    local output = module:forward(input1)
    equal(output, input1[1], "output dimension 1")
@@ -4448,6 +4504,32 @@ function nntest.SelectTable()
    gradInput = module:backward(input2, output)
    mytester:assert(#gradInput == #input2, "Table lengths")
    mytester:assert(#gradInput[2] == #input2[2], "Sub-Table lengths")
+   
+   -- test on tables of increasing size
+   local input1 = {torch.rand(3,4,5), torch.rand(3,4,5)}
+   local input2 = {torch.rand(3,4,5), torch.rand(3,4,5), torch.rand(3,4,5)}
+   local gradOutput1 = torch.randn(3,4,5)
+   local gradOutput2 = torch.randn(3,4,5)
+   
+   local module1 = nn.SelectTable(-1)
+   local output1 = module1:forward(input1):clone()
+   local output2 = module1:forward(input2)
+   local gradInput_ = module1:backward(input1, gradOutput1)
+   local gradInput1 = {}
+   for k,v in ipairs(gradInput_) do gradInput1[k] = v:clone() end
+   local gradInput2 = module1:backward(input2, gradOutput2)
+   
+   local module3 = nn.SelectTable(-1)
+   local module4 = nn.SelectTable(-1)
+   local output3 = module3:forward(input1)
+   local output4 = module4:forward(input2)
+   local gradInput3 = module3:backward(input1, gradOutput1)
+   local gradInput4 = module4:backward(input2, gradOutput2)
+   
+   equal(output1, output3, "output 1 and 3")
+   equal(output2, output4, "output 2 and 4")
+   equal(gradInput1, gradInput3, "gradInput 1 and 3")
+   equal(gradInput2, gradInput4, "gradInput 2 and 4")
 end
 
 function nntest.MixtureTable()
@@ -5459,49 +5541,54 @@ local function testBatchNormalization(moduleName, dim, k)
       table.insert(size, torch.random(1,k))
    end
    local input = torch.zeros(table.unpack(size)):uniform()
+
+   local function jacTests(module, input, affine)
+      local err = jac.testJacobian(module,input)
+      mytester:assertlt(err,precision, 'error on state ')
+
+      if affine then
+         local err = jac.testJacobianParameters(module, input,
+                                            module.weight, module.gradWeight)
+         mytester:assertlt(err,precision, 'error on weight ')
+
+         local err = jac.testJacobianParameters(module, input,
+                                            module.bias, module.gradBias)
+         mytester:assertlt(err,precision, 'error on weight ')
+
+         local err = jac.testJacobianUpdateParameters(module, input, module.weight)
+         mytester:assertlt(err,precision, 'error on weight [direct update] ')
+
+         local err = jac.testJacobianUpdateParameters(module, input, module.bias)
+         mytester:assertlt(err,precision, 'error on bias [direct update] ')
+
+         for t,err in pairs(jac.testAllUpdate(module, input, 'weight', 'gradWeight')) do
+            mytester:assertlt(err, precision, string.format(
+               'error on weight [%s]', t))
+         end
+
+         for t,err in pairs(jac.testAllUpdate(module, input, 'bias', 'gradBias')) do
+            mytester:assertlt(err, precision, string.format('error on bias [%s]', t))
+         end
+      end
+      
+      -- IO
+      local ferr,berr = jac.testIO(module,input)
+      mytester:asserteq(ferr, 0, torch.typename(module) .. ' - i/o forward err ')
+      mytester:asserteq(berr, 0, torch.typename(module) .. ' - i/o backward err ')
+   end
+      
    local module = nn[moduleName](planes)
-
-   local err = jac.testJacobian(module,input)
-   mytester:assertlt(err,precision, 'error on state ')
-
-   local err = jac.testJacobianParameters(module, input,
-                                      module.weight, module.gradWeight)
-   mytester:assertlt(err,precision, 'error on weight ')
-
-   local err = jac.testJacobianParameters(module, input,
-                                      module.bias, module.gradBias)
-   mytester:assertlt(err,precision, 'error on weight ')
-
-   local err = jac.testJacobianUpdateParameters(module, input, module.weight)
-   mytester:assertlt(err,precision, 'error on weight [direct update] ')
-
-   local err = jac.testJacobianUpdateParameters(module, input, module.bias)
-   mytester:assertlt(err,precision, 'error on bias [direct update] ')
-
-   for t,err in pairs(jac.testAllUpdate(module, input, 'weight', 'gradWeight')) do
-      mytester:assertlt(err, precision, string.format(
-         'error on weight [%s]', t))
-   end
-
-   for t,err in pairs(jac.testAllUpdate(module, input, 'bias', 'gradBias')) do
-      mytester:assertlt(err, precision, string.format('error on bias [%s]', t))
-   end
-
-   -- IO
-   local ferr,berr = jac.testIO(module,input)
-   mytester:asserteq(ferr, 0, torch.typename(module) .. ' - i/o forward err ')
-   mytester:asserteq(berr, 0, torch.typename(module) .. ' - i/o backward err ')
-
+   module:training()
+   jacTests(module, input, true)
+   module:evaluate()
+   jacTests(module, input, true)
+   
    -- batch norm without affine transform
    module = nn[moduleName](planes, 1e-5, 0.1, false)
-
-   local err = jac.testJacobian(module, input)
-   mytester:assertlt(err,precision, 'error on state ')
-
-   -- IO
-   local ferr,berr = jac.testIO(module,input)
-   mytester:asserteq(ferr, 0, torch.typename(module) .. ' - i/o forward err ')
-   mytester:asserteq(berr, 0, torch.typename(module) .. ' - i/o backward err ')
+   module:training()
+   jacTests(module, input, false)
+   module:evaluate()
+   jacTests(module, input, false)
 end
 
 function nntest.BatchNormalization()
@@ -5807,6 +5894,26 @@ function nntest.Cosine()
    mytester:assertTensorEq(cosine.gradWeight, cosine2.gradWeight, 0.000001, "Cosine gradWeight 2D err")
 end
 
+function nntest.ErrorHandling()
+   local l = nn.Linear(1, 1)
+   local p = nn.Parallel(1, 1):add(l)
+   local c = nn.Concat(1):add(p)
+   local model = nn.Sequential():add(nn.Identity()):add(c):add(nn.Identity())
+   local function errmsg(module, i)
+       return 'In ' .. i .. ' module of ' .. torch.type(module) .. ':\n'
+   end
+   local expected_err = errmsg(model, 2) .. errmsg(c, 1) .. errmsg(p, 1)
+   mytester:assertErrorObj(
+       function()
+           model:forward(torch.randn(1,2,2))
+       end,
+       function(err)
+           return err:find(expected_err) and err:find('size mismatch')
+       end,
+       "Failure expected or bad error message (missing information or reason)"
+   )
+end
+
 mytester:add(nntest)
 
 if not nn then
@@ -5819,7 +5926,7 @@ else
    sjac = nn.SparseJacobian
    function nn.test(tests, seed)
       -- randomize stuff
-      local seed = seed or os.time()
+      local seed = seed or (1e5 * torch.tic())
       print('Seed: ', seed)
       math.randomseed(seed)
       torch.manualSeed(seed)
